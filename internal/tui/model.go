@@ -84,10 +84,22 @@ type DeploymentCompleteMsg struct{}
 type tickMsg struct{}
 
 type Model struct {
-	viewport        viewport.Model
-	content         string
-	width           int
-	height          int
+	// Split pane viewports
+	localViewport  viewport.Model
+	remoteViewport viewport.Model
+	localContent   string
+	remoteContent  string
+	
+	// Log area at bottom
+	logContent string
+	
+	// Legacy single viewport (for non-terminal mode)
+	viewport viewport.Model
+	content  string
+	
+	width  int
+	height int
+	
 	outputCh        chan []byte
 	errCh           chan error
 	session         *deploy.Session
@@ -140,15 +152,37 @@ type Model struct {
 }
 
 func New(debug bool) (*Model, error) {
+	// Create main viewport (for non-terminal mode)
 	vp := viewport.New(0, 0)
-
-	// Create border style with Go gopher blue
 	borderStyle := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(gopherBlue)).
 		Padding(gutter, gutter, gutter, gutter)
-
 	vp.Style = borderStyle
+
+	// Create local viewport (orange border)
+	localVp := viewport.New(0, 0)
+	localBorderStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(rustCrab)).
+		BorderTop(true).
+		BorderBottom(true).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(gutter, gutter, gutter, gutter)
+	localVp.Style = localBorderStyle
+
+	// Create remote viewport (blue border)
+	remoteVp := viewport.New(0, 0)
+	remoteBorderStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(gopherBlue)).
+		BorderTop(true).
+		BorderBottom(true).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(gutter, gutter, gutter, gutter)
+	remoteVp.Style = remoteBorderStyle
 
 	// Initialize passphrase input
 	passphraseTi := textinput.New()
@@ -169,6 +203,11 @@ func New(debug bool) (*Model, error) {
 	return &Model{
 		viewport:         vp,
 		content:          "",
+		localViewport:    localVp,
+		remoteViewport:   remoteVp,
+		localContent:     "",
+		remoteContent:    "",
+		logContent:       "",
 		passphraseInput:  passphraseTi,
 		commandInput:     commandTi,
 		needsPassphrase:  false,
@@ -210,27 +249,54 @@ func getLocalUserHost() (string, string) {
 	return username, hostname
 }
 
-func (m Model) Init() tea.Cmd {
-	// If deployment script exists, start with that
-	// Otherwise, start with SSH connection
-	if len(m.deploymentSteps) > 0 {
-		// First establish SSH connection, then run deployment
-		return tea.Batch(
-			tea.EnterAltScreen,
-			m.StartTerminalSession(m.ctx, m.instance, m.command, m.credentialsPath, m.sshKeyPath, ""),
-			tick(),
-		)
-	} else {
-		// No deployment script, use regular command execution
-		if !strings.HasPrefix(m.content, "$ ") {
-			m.content = m.buildContentHeader()
+// checkPassphraseNeeded checks if the SSH key requires a passphrase
+func (m *Model) checkPassphraseNeeded() bool {
+	keyPath := m.sshKeyPath
+	if keyPath == "" {
+		keyPath = deploy.DefaultPrivateKeyPath()
+	}
+	
+	// Try to parse the key without passphrase
+	_, err := deploy.PublicKeyFile(keyPath, "")
+	if err != nil {
+		// Check if error is due to missing passphrase
+		if errors.Is(err, deploy.ErrPassphraseRequired) || 
+		   strings.Contains(err.Error(), "passphrase") ||
+		   strings.Contains(err.Error(), "password") {
+			return true
 		}
+	}
+	return false
+}
+
+func (m *Model) Init() tea.Cmd {
+	// Always start in terminal mode with both panes visible
+	m.terminalMode = true
+	m.localContent = fmt.Sprintf("Local Shell Ready\n%s@%s\n", m.localUser, m.localHost)
+	m.remoteContent = "Waiting for connection...\n"
+	
+	// Check if passphrase is needed BEFORE attempting connection
+	if m.checkPassphraseNeeded() {
+		m.needsPassphrase = true
+		m.commandInput.EchoMode = textinput.EchoPassword
+		m.commandInput.Focus()
+		m.logContent += "[INFO] SSH key requires a passphrase. Enter it below and press Enter.\n"
+		m.remoteContent = "Passphrase required for SSH key...\n"
 		return tea.Batch(
 			tea.EnterAltScreen,
-			m.StartSSHStream(m.ctx, m.instance, m.command, m.credentialsPath, m.sshKeyPath),
 			tick(),
+			textinput.Blink,
 		)
 	}
+	
+	// No passphrase needed, attempt connection immediately
+	m.remoteContent = "Connecting to remote terminal...\n"
+	return tea.Batch(
+		tea.EnterAltScreen,
+		m.StartTerminalSession(m.ctx, m.instance, m.command, m.credentialsPath, m.sshKeyPath, ""),
+		tick(),
+		textinput.Blink,
+	)
 }
 
 // SetInstanceAndCommand sets the instance and command for SSH streaming
@@ -251,7 +317,7 @@ func (m *Model) SetInstanceAndCommand(
 
 		// Initialize content
 		if len(deploymentSteps) > 0 {
-			m.statusMessage = "[INFO] Deployment script detected. Starting deployment..."
+			m.logContent += "[INFO] Deployment script detected. Starting deployment...\n"
 			m.content = ""
 		} else {
 		// Initialize content with the command displayed at the top
@@ -279,13 +345,51 @@ func (m Model) buildContentHeader() string {
 	return header + separator
 }
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		// Handle passphrase input
-		if m.needsPassphrase {
+		// Handle passphrase input in terminal mode (show in command prompt area)
+		if m.needsPassphrase && m.terminalMode {
+			// In terminal mode, passphrase input is handled via command input
+			keyStr := msg.String()
+			switch keyStr {
+			case "enter":
+				// Submit passphrase
+				m.pendingPassphrase = m.commandInput.Value()
+				if m.pendingPassphrase == "" {
+					// Empty passphrase, don't proceed
+					return m, nil
+				}
+				m.needsPassphrase = false
+				m.commandInput.EchoMode = textinput.EchoNormal // Reset to normal mode
+				m.commandInput.SetValue("")
+				m.logContent += "[INFO] Passphrase received. Connecting...\n"
+				m.remoteContent = "Connecting to remote terminal...\n"
+				// Retry connection with passphrase
+				return m, tea.Batch(
+					m.StartTerminalSession(m.ctx, m.instance, m.command, m.credentialsPath, m.sshKeyPath, m.pendingPassphrase),
+					tick(),
+					textinput.Blink,
+				)
+			case "esc":
+				// Cancel passphrase input
+				m.needsPassphrase = false
+				m.commandInput.EchoMode = textinput.EchoNormal // Reset to normal mode
+				m.commandInput.SetValue("")
+				m.logContent += "[INFO] Passphrase input cancelled\n"
+				return m, nil
+			default:
+				// Update command input (used for passphrase)
+				var inputCmd tea.Cmd
+				m.commandInput, inputCmd = m.commandInput.Update(msg)
+				return m, inputCmd
+			}
+		}
+		
+		// Handle passphrase input in non-terminal mode (legacy)
+		if m.needsPassphrase && !m.terminalMode {
 			switch msg.String() {
 			case "enter":
 				// Submit passphrase
@@ -297,13 +401,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.needsPassphrase = false
 				m.passphraseInput.SetValue("")
 				m.passphraseInput.Blur()
-				// Show connecting message in status
-				m.statusMessage = "[INFO] Passphrase received. Connecting..."
+				// Show connecting message in content (non-terminal mode)
+				m.content += "[INFO] Passphrase received. Connecting...\n"
 				m.viewport.SetContent(m.wrapContent(m.content))
 				m.viewport.GotoBottom()
-				// Retry connection with passphrase - use terminal mode
+				// Retry connection with passphrase
 				return m, tea.Batch(
-					m.StartTerminalSession(m.ctx, m.instance, m.command, m.credentialsPath, m.sshKeyPath, m.pendingPassphrase),
+					m.StartSSHStream(m.ctx, m.instance, m.command, m.credentialsPath, m.sshKeyPath),
 					tick(),
 				)
 			case "esc":
@@ -311,7 +415,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.needsPassphrase = false
 				m.passphraseInput.SetValue("")
 				m.passphraseInput.Blur()
-				m.statusMessage = "[INFO] Passphrase input cancelled"
+				m.content += "[INFO] Passphrase input cancelled\n"
 				m.viewport.SetContent(m.wrapContent(m.content))
 				m.viewport.GotoBottom()
 				return m, nil
@@ -331,21 +435,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if keyStr == "esc" {
 				if m.vimMode == InsertMode {
 					m.vimMode = NormalMode
-					m.statusMessage = "[INFO] Normal mode (press 'i' to insert, 'q' to quit)"
+					m.logContent += "[INFO] Normal mode (press 'i' to insert, 'q' to quit)\n"
 					m.commandInput.Blur()
 				} else {
 					m.vimMode = InsertMode
-					m.statusMessage = "[INFO] Insert mode"
+					m.logContent += "[INFO] Insert mode\n"
 					// Focus command input when entering insert mode
 					m.commandInput.Focus()
 				}
-				// Clear status message after a short delay
-				return m, tea.Sequence(
-					tick(),
-					tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-						return tickMsg{}
-					}),
-				)
+				return m, tick()
 			}
 			
 			// Handle quit only in normal mode
@@ -362,15 +460,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Handle 'i' key in normal mode to enter insert mode
 			if keyStr == "i" && m.vimMode == NormalMode {
 				m.vimMode = InsertMode
-				m.statusMessage = "[INFO] Insert mode"
+				m.logContent += "[INFO] Insert mode\n"
 				m.commandInput.Focus()
-				// Clear status message after a short delay
-				return m, tea.Sequence(
-					tick(),
-					tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-						return tickMsg{}
-					}),
-				)
+				return m, tick()
 			}
 			
 			// In normal mode, only allow special keys (quit, insert, mode toggle)
@@ -390,10 +482,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Toggle between local and remote shell
 				if m.shellMode == RemoteShell {
 					m.shellMode = LocalShell
-					m.statusMessage = "[INFO] Switched to local shell mode"
+					m.logContent += "[INFO] Switched to local shell mode\n"
 				} else {
 					m.shellMode = RemoteShell
-					m.statusMessage = "[INFO] Switched to remote shell mode"
+					m.logContent += "[INFO] Switched to remote shell mode\n"
 				}
 				// Clear command input when switching modes
 				m.commandInput.SetValue("")
@@ -423,11 +515,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Add to history
 					m.commandHistory = append(m.commandHistory, commandText)
 					
-					// Clear status message when executing command
-					m.statusMessage = ""
-					
 					// Route command based on shell mode
 					if m.shellMode == LocalShell {
+						// Prepend prompt to local shell before command
+						prompt := fmt.Sprintf("%s@%s $ %s\n", m.localUser, m.localHost, commandText)
+						m.localContent += prompt
 						// Execute locally
 						return m, tea.Batch(
 							m.StartLocalCommand(commandText),
@@ -516,52 +608,67 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		// The border style handles padding, so we need to account for:
-		// - Border lines (top + bottom = 2)
-		// - Padding (gutter * 2 for top + bottom)
-		// - Help text (1 line)
-		borderStyle := m.viewport.Style
-		borderHeight := borderStyle.GetVerticalFrameSize()
-		helpHeight := 1
-		availableHeight := msg.Height - borderHeight - helpHeight
-		if availableHeight < 1 {
-			availableHeight = 1
-		}
-
-		// Width: border handles padding
-		borderWidth := borderStyle.GetHorizontalFrameSize()
-		availableWidth := msg.Width - borderWidth
-		if availableWidth < 1 {
-			availableWidth = 1
-		}
-
-		m.viewport.Width = availableWidth
-		m.viewport.Height = availableHeight
-
-		// Update command input width in terminal mode
 		if m.terminalMode {
-			m.commandInput.Width = availableWidth - 2 // Account for "$ " prompt (2 chars)
+			// Terminal mode: calculate split pane sizes
+			logAreaHeight := 4
+			commandAreaHeight := 1 // Always single line
+			helpHeight := 1
+			reservedHeight := logAreaHeight + commandAreaHeight + helpHeight
+			
+			paneHeight := msg.Height - reservedHeight
+			if paneHeight < 5 {
+				paneHeight = 5
+			}
+			
+			paneWidth := (msg.Width - 1) / 2
+			if paneWidth < 20 {
+				paneWidth = 20
+			}
+			
+			m.localViewport.Width = paneWidth
+			m.localViewport.Height = paneHeight
+			m.remoteViewport.Width = paneWidth
+			m.remoteViewport.Height = paneHeight
+			
+			// Update command input width
+			m.commandInput.Width = (paneWidth*2 + 1) - 2 // Full width minus "$ "
 			if m.commandInput.Width < 1 {
 				m.commandInput.Width = 1
 			}
 			
-			// Resize terminal PTY to match viewport width
-			// This ensures terminal output respects the border
-			if m.terminalSession != nil && availableWidth > 0 && availableHeight > 0 {
-				m.terminalSession.Resize(availableWidth, availableHeight)
+			// Resize terminal PTY to match remote pane width
+			if m.terminalSession != nil && paneWidth > 0 && paneHeight > 0 {
+				// Account for border padding
+				borderWidth := m.remoteViewport.Style.GetHorizontalFrameSize()
+				termWidth := paneWidth - borderWidth
+				if termWidth > 0 {
+					m.terminalSession.Resize(termWidth, paneHeight)
+				}
 			}
-		}
-
-		// Ensure content has command header (if not in terminal mode)
-		if !m.terminalMode && !strings.HasPrefix(m.content, "$ ") {
-			m.content = m.buildContentHeader() + m.content
-		}
-		
-		// For terminal mode, wrap content to viewport width to respect border
-		// We need to wrap even terminal content to prevent overflow
-		if m.terminalMode {
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
 		} else {
+			// Non-terminal mode: single viewport
+			borderStyle := m.viewport.Style
+			borderHeight := borderStyle.GetVerticalFrameSize()
+			helpHeight := 1
+			availableHeight := msg.Height - borderHeight - helpHeight
+			if availableHeight < 1 {
+				availableHeight = 1
+			}
+
+			borderWidth := borderStyle.GetHorizontalFrameSize()
+			availableWidth := msg.Width - borderWidth
+			if availableWidth < 1 {
+				availableWidth = 1
+			}
+
+			m.viewport.Width = availableWidth
+			m.viewport.Height = availableHeight
+
+			// Ensure content has command header
+			if !strings.HasPrefix(m.content, "$ ") {
+				m.content = m.buildContentHeader() + m.content
+			}
+			
 			m.viewport.SetContent(m.wrapContent(m.content))
 		}
 
@@ -569,7 +676,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle terminal mode output
 		if m.terminalMode {
 			// Read output from both local and remote channels
-			outputReceived := false
 			maxReads := 10 // Limit reads per tick to avoid blocking
 			reads := 0
 			
@@ -578,17 +684,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				select {
 				case data, ok := <-m.terminalOutputCh:
 					if ok {
-						m.content += string(data)
-						outputReceived = true
+						m.remoteContent += string(data)
 						reads++
-						// Clear informational status messages when output arrives
-						// But preserve vim mode status messages
-						if m.statusMessage != "" && 
-						   (strings.HasPrefix(m.statusMessage, "[INFO]") || 
-						    strings.HasPrefix(m.statusMessage, "[SUCCESS]")) &&
-						   !strings.Contains(m.statusMessage, "mode") {
-							m.statusMessage = ""
-						}
 					} else {
 						goto doneRemoteReading
 					}
@@ -603,17 +700,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				select {
 				case data, ok := <-m.localOutputCh:
 					if ok {
-						m.content += string(data)
-						outputReceived = true
+						m.localContent += string(data)
 						reads++
-						// Clear informational status messages when output arrives
-						// But preserve vim mode status messages
-						if m.statusMessage != "" && 
-						   (strings.HasPrefix(m.statusMessage, "[INFO]") || 
-						    strings.HasPrefix(m.statusMessage, "[SUCCESS]")) &&
-						   !strings.Contains(m.statusMessage, "mode") {
-							m.statusMessage = ""
-						}
 					} else {
 						goto doneLocalReading
 					}
@@ -626,16 +714,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Check for local errors
 			select {
 			case err := <-m.localErrCh:
-				m.content += fmt.Sprintf("\n[ERROR] %v\n", err)
-				outputReceived = true
+				m.localContent += fmt.Sprintf("\n[ERROR] %v\n", err)
 			default:
 			}
 			
-			if outputReceived {
-				// Wrap terminal content to respect viewport width and border
-				m.viewport.SetContent(m.wrapTerminalContent(m.content))
-				m.viewport.GotoBottom()
-			}
+			// No need to update viewports here - View() will handle it
 		} else {
 			// Check for new output from channels (command execution mode)
 			select {
@@ -656,18 +739,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tick()
 	
 	case LocalOutputMsg:
-		// Append local command output
-		m.content += string(msg.Data)
-		// Clear status message when output arrives
-		if m.statusMessage != "" && !strings.HasPrefix(m.statusMessage, "[") {
-			m.statusMessage = ""
-		}
+		// Append local command output to local pane
 		if m.terminalMode {
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
+			m.localContent += string(msg.Data)
 		} else {
+			m.content += string(msg.Data)
 			m.viewport.SetContent(m.wrapContent(m.content))
+			m.viewport.GotoBottom()
 		}
-		m.viewport.GotoBottom()
+		// Status messages are now in log pane
 		
 		// If deployment is running and this is a local step, check if we should continue
 		// (We'll continue after a delay to allow output to finish)
@@ -684,17 +764,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	
 	case LocalErrorMsg:
 		// Handle local command error
-		m.statusMessage = fmt.Sprintf("[ERROR] Local command failed: %v", msg.Error)
 		if m.terminalMode {
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
+			m.localContent += fmt.Sprintf("\n[ERROR] %v\n", msg.Error)
+			m.logContent += fmt.Sprintf("[ERROR] Local command failed: %v\n", msg.Error)
 		} else {
+			m.content += fmt.Sprintf("\n[ERROR] Local command failed: %v\n", msg.Error)
 			m.viewport.SetContent(m.wrapContent(m.content))
+			m.viewport.GotoBottom()
 		}
-		m.viewport.GotoBottom()
 		// If deployment is running, stop it
 		if m.deploymentRunning {
 			m.deploymentRunning = false
-			m.statusMessage = "[INFO] Deployment stopped due to error"
+			m.logContent += "[INFO] Deployment stopped due to error\n"
 		}
 		return m, tick()
 	
@@ -704,18 +785,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.StartDeploymentScript()
 		}
 		
-		// Show deployment step info in status
+		// Show deployment step info in log area
 		targetLabel := "local"
 		if msg.Step.Target == "remote" {
 			targetLabel = "remote"
 		}
-		m.statusMessage = fmt.Sprintf("[%d/%d] Running %s: %s", msg.StepNum, msg.Total, targetLabel, msg.Step.Command)
+		logMsg := fmt.Sprintf("[STEP] [%d/%d] Running %s: %s", msg.StepNum, msg.Total, targetLabel, msg.Step.Command)
 		if m.terminalMode {
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
+			m.logContent += logMsg + "\n"
 		} else {
+			m.content += logMsg + "\n"
 			m.viewport.SetContent(m.wrapContent(m.content))
+			m.viewport.GotoBottom()
 		}
-		m.viewport.GotoBottom()
 		
 		// For remote steps, wait a bit then continue to next step
 		// For local steps, wait for command completion (handled in LocalOutputMsg)
@@ -733,21 +815,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Deployment complete
 		m.deploymentRunning = false
 		m.deploymentComplete = true
-		m.statusMessage = "[SUCCESS] Deployment script completed. SSH session preserved for manual use."
 		if m.terminalMode {
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
+			m.logContent += "[SUCCESS] Deployment script completed. SSH session preserved for manual use.\n"
 		} else {
+			m.content += "[SUCCESS] Deployment script completed. SSH session preserved for manual use.\n"
 			m.viewport.SetContent(m.wrapContent(m.content))
+			m.viewport.GotoBottom()
 		}
-		m.viewport.GotoBottom()
 		return m, tick()
 
 	case SSHOutputMsg:
 		// Append new output to content
-		// Clear status message when output arrives
-		if strings.Contains(m.statusMessage, "Connecting") {
-			m.statusMessage = ""
-		}
 		m.content += string(msg.Data)
 		m.viewport.SetContent(m.wrapContent(m.content))
 		// Auto-scroll to bottom
@@ -759,8 +837,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalSession = msg.Session
 		m.terminalMode = true
 		
-		// Clear connecting message and set status
-		m.statusMessage = "[SUCCESS] Terminal connected. Waiting for shell..."
+		// Log connection success
+		m.logContent += "[SUCCESS] Terminal connected. Waiting for shell...\n"
 		
 		// Update remote user/host from instance details
 		// Try to get instance details to set remote hostname
@@ -772,35 +850,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.remoteHost = m.instance.Name
 		}
 		
-		// Resize terminal to match viewport if we have dimensions
-		// Use the available width (accounting for border padding) to ensure output respects border
-		if m.terminalSession != nil {
-			termWidth := m.viewport.Width
-			termHeight := m.viewport.Height
-			if termWidth <= 0 {
-				// Fallback: calculate from window size if viewport not set yet
-				if m.width > 0 {
-					borderStyle := m.viewport.Style
-					borderWidth := borderStyle.GetHorizontalFrameSize()
-					termWidth = m.width - borderWidth
-				}
-				if termWidth <= 0 {
-					termWidth = 80 // Final fallback
-				}
-			}
-			if termHeight <= 0 {
-				if m.height > 0 {
-					borderStyle := m.viewport.Style
-					borderHeight := borderStyle.GetVerticalFrameSize()
-					termHeight = m.height - borderHeight - 1 // Account for help text
-				}
-				if termHeight <= 0 {
-					termHeight = 24 // Final fallback
-				}
-			}
-			m.terminalSession.Resize(termWidth, termHeight)
-		}
-		
+		// Resize terminal PTY will be handled by window resize message
 		// Focus command input
 		m.commandInput.Focus()
 		
@@ -808,8 +858,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Otherwise, execute the initial command
 		if len(m.deploymentSteps) > 0 {
 			// Start deployment script after shell initializes
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
-			m.viewport.GotoBottom()
 			return m, tea.Batch(
 				tick(),
 				textinput.Blink,
@@ -839,8 +887,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Don't echo command here - let the terminal handle it naturally
 				}()
 			}
-			m.viewport.SetContent(m.wrapTerminalContent(m.content))
-			m.viewport.GotoBottom()
 			return m, tea.Batch(tick(), textinput.Blink)
 		}
 	
@@ -851,76 +897,284 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		   strings.Contains(msg.Error.Error(), "passphrase required") {
 			if !m.needsPassphrase {
 				m.needsPassphrase = true
-				m.passphraseInput.Focus()
-				m.statusMessage = "[INFO] SSH key requires a passphrase. Please enter it below."
-				m.viewport.SetContent(m.wrapContent(m.content))
-				m.viewport.GotoBottom()
+				if m.terminalMode {
+					// In terminal mode, use command input for passphrase
+					m.commandInput.EchoMode = textinput.EchoPassword
+					m.commandInput.Focus()
+					m.logContent += "[INFO] SSH key requires a passphrase. Enter it below and press Enter.\n"
+				} else {
+					// Non-terminal mode, use passphrase input
+					m.passphraseInput.Focus()
+					m.content += "[INFO] SSH key requires a passphrase. Please enter it below.\n"
+					m.viewport.SetContent(m.wrapContent(m.content))
+					m.viewport.GotoBottom()
+				}
 				return m, textinput.Blink
 			}
 		} else {
-			m.statusMessage = fmt.Sprintf("[ERROR] %v", msg.Error)
-			m.viewport.SetContent(m.wrapContent(m.content))
-			m.viewport.GotoBottom()
+			if m.terminalMode {
+				m.logContent += fmt.Sprintf("[ERROR] SSH connection failed: %v\n", msg.Error)
+			} else {
+				m.content += fmt.Sprintf("[ERROR] %v\n", msg.Error)
+				m.viewport.SetContent(m.wrapContent(m.content))
+				m.viewport.GotoBottom()
+			}
 		}
 
 	case PassphraseNeededMsg:
 		m.needsPassphrase = true
 		m.passphraseInput.Focus()
-		m.statusMessage = fmt.Sprintf("[INFO] SSH key at %s requires a passphrase. Please enter it below.", msg.KeyPath)
+		m.content += fmt.Sprintf("[INFO] SSH key at %s requires a passphrase. Please enter it below.\n", msg.KeyPath)
 		m.viewport.SetContent(m.wrapContent(m.content))
 		m.viewport.GotoBottom()
 		return m, textinput.Blink
 	}
 
-	m.viewport, cmd = m.viewport.Update(msg)
-	return m, cmd
+	// Update viewports (for non-terminal mode and for potential scrolling in terminal mode)
+	if m.terminalMode {
+		// In terminal mode, update both panes for scrolling
+		var localCmd, remoteCmd tea.Cmd
+		m.localViewport, localCmd = m.localViewport.Update(msg)
+		m.remoteViewport, remoteCmd = m.remoteViewport.Update(msg)
+		return m, tea.Batch(localCmd, remoteCmd)
+	} else {
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
 }
 
-func (m Model) View() string {
-	view := m.viewport.View()
+func (m *Model) View() string {
+	// Terminal mode: show split panes (passphrase handled in command area)
+	if m.terminalMode {
+		return m.renderSplitPaneView()
+	}
 	
-	// Show passphrase input if needed
+	// Non-terminal mode: show single viewport
+	// Show passphrase input if needed (legacy non-terminal mode)
 	if m.needsPassphrase {
+		view := m.viewport.View()
 		view += "\n"
 		view += lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("Enter passphrase: ")
 		view += m.passphraseInput.View()
 		view += "\n"
 		view += lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("  Press Enter to submit, Esc to cancel")
+		return view
 	}
 	
-	// Show command input in terminal mode (only show if terminalMode is true)
-	if m.terminalMode {
-		view += "\n"
-		// Color code prompt based on shell mode - just show "$ "
-		var promptColor string
+	view := m.viewport.View()
+	view += m.helpView()
+	return view
+}
+
+// renderSplitPaneView renders the split-pane layout with local/remote terminals and log area
+func (m *Model) renderSplitPaneView() string {
+	// If window size hasn't been set yet, return a minimal view
+	if m.width <= 0 || m.height <= 0 {
+		return "Initializing..."
+	}
+	
+	// Calculate available space
+	// Reserve space for:
+	// - Log area at bottom (4 lines)
+	// - Command prompt (1 line - always single line)
+	// - Help text (1 line)
+	logAreaHeight := 4
+	commandAreaHeight := 1 // Always single line
+	helpHeight := 1
+	reservedHeight := logAreaHeight + commandAreaHeight + helpHeight
+	
+	// Calculate pane heights
+	paneHeight := m.height - reservedHeight
+	if paneHeight < 5 {
+		paneHeight = 5 // Minimum height
+	}
+	
+	// Calculate pane widths (split 50/50)
+	// Viewport Width property includes borders, so we calculate total pane width
+	separatorWidth := 1 // Space between panes
+	
+	// Calculate total width available for both panes
+	// Each pane gets half, accounting for the separator
+	availableWidth := m.width - separatorWidth
+	paneWidth := availableWidth / 2
+	
+	// Ensure minimum dimensions
+	if paneWidth < 20 {
+		paneWidth = 20
+	}
+	if paneWidth < 1 {
+		paneWidth = 1
+	}
+	if paneHeight < 1 {
+		paneHeight = 1
+	}
+	
+	// Update viewport sizes (width includes borders)
+	m.localViewport.Width = paneWidth
+	m.localViewport.Height = paneHeight
+	m.remoteViewport.Width = paneWidth
+	m.remoteViewport.Height = paneHeight
+	
+	// Get border widths for content wrapping
+	localBorderWidth := m.localViewport.Style.GetHorizontalFrameSize()
+	remoteBorderWidth := m.remoteViewport.Style.GetHorizontalFrameSize()
+	
+	// Wrap content for viewports (content width excludes borders)
+	localContentWidth := paneWidth - localBorderWidth
+	remoteContentWidth := paneWidth - remoteBorderWidth
+	
+	// Ensure content width is valid
+	if localContentWidth < 1 {
+		localContentWidth = 1
+	}
+	if remoteContentWidth < 1 {
+		remoteContentWidth = 1
+	}
+	
+	// Helper function to wrap content for a specific width
+	wrapForWidth := func(content string, maxWidth int) string {
+		width := maxWidth
+		if width <= 0 {
+			width = 20
+		}
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+		content = strings.ReplaceAll(content, "\r", "\n")
+		lines := strings.Split(content, "\n")
+		wrappedLines := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if len(line) == 0 {
+				wrappedLines = append(wrappedLines, "")
+				continue
+			}
+			wrapped := wordwrap.String(line, width)
+			wrappedLines = append(wrappedLines, wrapped)
+		}
+		return strings.Join(wrappedLines, "\n")
+	}
+	
+	// Set content - don't call GotoBottom here as it can panic if viewport isn't ready
+	// GotoBottom will be called in Update() when content changes
+	localWrapped := wrapForWidth(m.localContent, localContentWidth)
+	m.localViewport.SetContent(localWrapped)
+	
+	remoteWrapped := wrapForWidth(m.remoteContent, remoteContentWidth)
+	m.remoteViewport.SetContent(remoteWrapped)
+	
+	// Render panes side by side
+	localPane := m.localViewport.View()
+	remotePane := m.remoteViewport.View()
+	// Join with a single space separator
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, localPane, " ", remotePane)
+	
+	// Calculate full width for bottom areas
+	// The bottom panes should match the total width of the joined panes
+	// Get actual rendered width of joined panes by measuring the first line
+	panesLines := strings.Split(panes, "\n")
+	var fullWidth int
+	if len(panesLines) > 0 {
+		// Get the width of the first line (should be consistent across all lines)
+		renderedWidth := len([]rune(panesLines[0]))
+		fullWidth = renderedWidth
+	} else {
+		// Fallback: calculate from pane widths + separator
+		fullWidth = paneWidth + separatorWidth + paneWidth
+	}
+	
+	// Ensure fullWidth doesn't exceed window width (safety clamp)
+	if fullWidth > m.width {
+		fullWidth = m.width
+	}
+	
+	// Build log area
+	logArea := m.renderLogArea(fullWidth)
+	
+	// Build command prompt area
+	commandArea := m.renderCommandArea(fullWidth)
+	
+	// Combine everything with proper spacing
+	view := panes + "\n" + logArea + "\n" + commandArea + "\n" + m.helpView()
+	return view
+}
+
+// renderLogArea renders the log area at the bottom
+func (m *Model) renderLogArea(width int) string {
+	// Ensure width doesn't exceed window width
+	if width > m.width {
+		width = m.width
+	}
+	// Create a simple bordered box for logs with all borders visible
+	logStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("241")).
+		BorderTop(true).
+		BorderBottom(true).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(0, 1).
+		Width(width).
+		Height(4)
+	
+	// Wrap log content
+	logLines := strings.Split(m.logContent, "\n")
+	if len(logLines) > 4 {
+		logLines = logLines[len(logLines)-4:] // Show last 4 lines
+	}
+	logText := strings.Join(logLines, "\n")
+	
+	return logStyle.Render(logText)
+}
+
+// renderCommandArea renders the command prompt (single line only)
+func (m *Model) renderCommandArea(width int) string {
+	// Ensure width doesn't exceed window width
+	if width > m.width {
+		width = m.width
+	}
+	// Create a bordered box for the command area
+	var promptColor string
+	var promptText string
+	
+	if m.needsPassphrase {
+		// Show passphrase prompt
+		promptColor = "241"
+		promptText = "Enter passphrase: "
+	} else {
+		// Show regular command prompt
 		if m.shellMode == LocalShell {
 			promptColor = rustCrab
 		} else {
 			promptColor = gopherBlue
 		}
-		view += lipgloss.NewStyle().Foreground(lipgloss.Color(promptColor)).Render("$ ")
-		view += m.commandInput.View()
-		
-		// Show status message below command prompt if present
-		if m.statusMessage != "" {
-			view += "\n"
-			// Color code status message based on type
-			var statusColor string
-			if strings.HasPrefix(m.statusMessage, "[ERROR]") {
-				statusColor = "1" // Red
-			} else if strings.HasPrefix(m.statusMessage, "[SUCCESS]") {
-				statusColor = "2" // Green
-			} else if strings.HasPrefix(m.statusMessage, "[INFO]") {
-				statusColor = "241" // Gray
-			} else {
-				statusColor = "241"
-			}
-			view += lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Render(m.statusMessage)
-		}
+		promptText = "$ "
 	}
 	
-	view += m.helpView()
-	return view
+	// Calculate border padding for command area
+	borderPadding := 4 // Left + right borders + padding
+	// Update command input width (account for prompt + border padding)
+	m.commandInput.Width = width - len(promptText) - borderPadding
+	if m.commandInput.Width < 1 {
+		m.commandInput.Width = 1
+	}
+	
+	var result strings.Builder
+	result.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(promptColor)).Render(promptText))
+	result.WriteString(m.commandInput.View())
+	
+	// Always single line - no status messages here
+	commandHeight := 1
+	
+	commandStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("241")).
+		BorderTop(true).
+		BorderBottom(true).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(0, 1).
+		Width(width).
+		Height(commandHeight)
+	
+	return commandStyle.Render(result.String())
 }
 
 func (m Model) helpView() string {
